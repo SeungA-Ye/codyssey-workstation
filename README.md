@@ -71,11 +71,12 @@ git version 2.53.0
 - [x] attach / exec 차이 관찰 → [7장](#7-docker-기본-운영--컨테이너-실습)
 - [x] Dockerfile 작성·빌드·실행 (커스텀 이미지) → [8장](#8-dockerfile-커스텀-이미지--포트-매핑)
 - [x] 포트 매핑 접속 2회 (8080, 8081) → [8장](#8-dockerfile-커스텀-이미지--포트-매핑)
+- [x] 포트 충돌 재현 · 점유 주체 확인 · 해제 → [8-6](#8-6-포트-충돌-진단--해제-재현-실습)
 - [x] 바인드 마운트 변경 반영 → [9장](#9-바인드-마운트--볼륨-영속성)
 - [x] Docker 볼륨 영속성 → [9장](#9-바인드-마운트--볼륨-영속성)
 - [x] Git 사용자 정보·기본 브랜치 설정 → [10장](#10-git-설정--githubvscode-연동)
 - [x] VSCode GitHub 로그인 및 저장소 연동 → [10장](#10-git-설정--githubvscode-연동)
-- [x] 트러블슈팅 2건 이상 (4건) → [11장](#11-트러블슈팅)
+- [x] 트러블슈팅 2건 이상 (5건) → [11장](#11-트러블슈팅)
 
 ---
 
@@ -399,6 +400,101 @@ $ docker logs web-8080 2>&1 | tail -5
 
 같은 이미지로 만든 컨테이너 2개를 **호스트의 서로 다른 포트(8080, 8081)** 에 연결해 각각 접속했습니다. 컨테이너 내부 포트는 둘 다 80입니다.
 
+### 8-6. 포트 충돌 진단 · 해제 (재현 실습)
+
+이미 `web-8080`이 호스트 8080을 사용 중인 상태에서 같은 포트로 컨테이너를 하나 더 실행해 충돌을 재현하고, **확인 → 해제 → 복구** 절차를 검증했습니다.
+
+**① 현재 포트 점유 현황 확인**
+
+```bash
+$ docker ps --format 'table {{.Names}}\t{{.Ports}}'
+NAMES        PORTS
+vol-reader
+bind-test    0.0.0.0:8082->80/tcp, [::]:8082->80/tcp
+web-8081     0.0.0.0:8081->80/tcp, [::]:8081->80/tcp
+web-8080     0.0.0.0:8080->80/tcp, [::]:8080->80/tcp
+```
+
+**② 충돌 재현**
+
+```bash
+$ docker run -d -p 8080:80 --name port-conflict codyssey-web:1.0
+f71ecfaa655e0296898990322f237c841afe2b31b46b1913d1a3755d654ba185
+docker: Error response from daemon: failed to set up container networking: driver failed programming external connectivity on endpoint port-conflict (...): Bind for 0.0.0.0:8080 failed: port is already allocated
+
+$ docker ps -a --filter name=port-conflict
+CONTAINER ID   IMAGE              COMMAND                  CREATED        STATUS    PORTS     NAMES
+f71ecfaa655e   codyssey-web:1.0   "/docker-entrypoint.…"   1 second ago   Created             port-conflict
+```
+
+→ 포트 연결에 실패한 컨테이너는 실행되지 않고 `Created` 상태로 남습니다. 이후 같은 이름으로 다시 만들려면 반드시 삭제해야 합니다.
+
+**③ 8080을 사용 중인 주체 확인 — 3단계**
+
+| 단계 | 위치 | 명령 | 확인 내용 |
+|---|---|---|---|
+| 1 | Docker | `docker ps --filter publish=8080` | 8080을 게시한 **컨테이너** |
+| 2 | WSL Ubuntu | `ss -ltn \| grep 8080` | 8080이 **LISTEN** 상태인지 |
+| 3 | Windows 호스트 | `netstat -ano \| findstr :8080` → `tasklist /FI "PID eq <PID>"` | 포트를 잡은 **Windows 프로세스** |
+
+```bash
+$ docker ps --filter publish=8080
+CONTAINER ID   IMAGE              COMMAND                  CREATED          STATUS                    PORTS                                     NAMES
+eed93d7ea423   codyssey-web:1.0   "/docker-entrypoint.…"   58 minutes ago   Up 58 minutes (healthy)   0.0.0.0:8080->80/tcp, [::]:8080->80/tcp   web-8080
+
+$ ss -ltn | grep 8080
+LISTEN 0      4096                *:8080             *:*
+```
+
+```powershell
+PS C:\Users\USER> netstat -ano | findstr :8080
+  TCP    0.0.0.0:8080           0.0.0.0:0              FIN_WAIT_1      20928
+  TCP    127.0.0.1:52876        127.0.0.1:8080         CLOSED          0
+  TCP    [::]:8080              [::]:0                 FIN_WAIT_1      20928
+  TCP    [::1]:8080             [::]:0                 CLOSED          1500
+PS C:\Users\USER> tasklist /FI "PID eq 20928"
+
+이미지 이름                    PID 세션 이름              세션#  메모리 사용
+========================= ======== ================ =========== ============
+com.docker.backend.exe       20928 Console                    2    154,768 K
+```
+
+→ Windows에서 8080을 잡고 있는 프로세스는 nginx가 아니라 **`com.docker.backend.exe`(Docker Desktop)** 입니다. Docker Desktop이 컨테이너를 대신해 호스트 포트를 열기 때문입니다. 따라서 Windows 도구로 Docker 프로세스가 확인되면, **어느 컨테이너인지는 1단계 `docker ps --filter publish=<포트>`로 특정**합니다. Docker가 아닌 다른 프로그램이 나오면 그 프로그램을 종료하거나 다른 호스트 포트를 사용합니다.
+
+> 참고: `ss -ltnp`로 프로세스까지 보려면 sudo 권한이 필요하며, Docker Desktop 환경에서는 포트를 Windows 측 프로세스가 잡고 있어 WSL에서는 프로세스명이 표시되지 않습니다.
+
+**④ 해제 → 재실행 → 복구**
+
+```bash
+$ docker rm -f port-conflict            # Created 상태로 남은 실패 컨테이너 정리
+port-conflict
+$ docker stop web-8080                  # 8080 점유 컨테이너 중지 → 포트 해제
+web-8080
+$ docker run -d -p 8080:80 --name port-conflict codyssey-web:1.0   # 같은 포트로 재실행 → 성공
+27a1c6ae74bd9952f889816eaac5682318096b0fbdc07af15e13f92ae171ac87
+$ curl -s http://localhost:8080 | head -5
+<!DOCTYPE html>
+<html lang="ko">
+<head><meta charset="UTF-8"><title>Codyssey Workstation</title></head>
+<body>
+  <h1>Hello, Codyssey!</h1>
+$ docker rm -f port-conflict            # 실습 컨테이너 삭제
+port-conflict
+$ docker start web-8080                 # 원래 서비스 복구
+web-8080
+$ docker ps --filter publish=8080
+CONTAINER ID   IMAGE              COMMAND                  CREATED          STATUS                                     PORTS                                     NAMES
+eed93d7ea423   codyssey-web:1.0   "/docker-entrypoint.…"   58 minutes ago   Up Less than a second (health: starting)   0.0.0.0:8080->80/tcp, [::]:8080->80/tcp   web-8080
+```
+
+**해결 선택지 정리**
+
+| 상황 | 조치 |
+|---|---|
+| 기존 컨테이너가 더 이상 필요 없음 | `docker stop <이름>` 또는 `docker rm -f <이름>`으로 포트 해제 |
+| 기존 서비스를 유지해야 함 | 호스트 포트만 바꿔 실행 (예: `-p 8083:80`). 컨테이너 내부 포트 80은 그대로 |
+| Docker가 아닌 프로그램이 점유 | `netstat`·`tasklist`로 찾은 프로그램 종료 후 재실행, 또는 다른 호스트 포트 사용 |
+
 ---
 
 ## 9. 바인드 마운트 · 볼륨 영속성
@@ -498,6 +594,14 @@ init.defaultbranch=main
 
 - 이메일은 GitHub가 제공하는 **noreply 주소**를 사용해 실제 이메일 노출을 방지했습니다.
 
+```bash
+$ git remote -v
+origin  https://github.com/SeungA-Ye/codyssey-workstation.git (fetch)
+origin  https://github.com/SeungA-Ye/codyssey-workstation.git (push)
+```
+
+- 로컬 저장소가 GitHub 원격 저장소(`origin`)와 연결되어 있음을 확인. URL에 토큰 등 인증 정보가 포함되어 있지 않음.
+
 ### 10-2. VSCode GitHub 로그인 · 저장소 연동
 
 1. WSL Ubuntu에서 `code .` → VSCode를 **`WSL: Ubuntu` 원격 모드**로 실행
@@ -551,6 +655,18 @@ init.defaultbranch=main
 | 원인 가설 | VSCode에 WSL 확장이 없어 Windows 측에서 네트워크 경로(`\\wsl.localhost\...`)로 폴더를 열었음. 이 경우 Ubuntu가 아닌 Windows Git과 그 설정이 사용됨 |
 | 확인 | 원격 표시기가 비어 있음 / 확장 마켓플레이스에서 WSL 미설치 확인 |
 | 해결 | Microsoft `WSL` 확장 설치 → `WSL에서 폴더 다시 열기` → 제목줄·상태바에 `WSL: Ubuntu` 표시 확인 |
+
+<a id="ts-5"></a>
+### ⑤ 포트 충돌 (`port is already allocated`)
+
+| 단계 | 내용 |
+|---|---|
+| 문제 | `docker run -p 8080:80 ...` 실행 시 `Bind for 0.0.0.0:8080 failed: port is already allocated` |
+| 원인 가설 | 호스트 8080 포트를 다른 컨테이너나 프로그램이 이미 사용 중 |
+| 확인 | `docker ps --filter publish=8080` → `web-8080`이 점유 / `ss -ltn` → 8080 LISTEN / Windows `netstat -ano` + `tasklist` → `com.docker.backend.exe` |
+| 해결 | 실패 컨테이너(`Created`) 삭제 → `docker stop web-8080`으로 포트 해제 → 재실행 성공. 기존 서비스를 유지해야 하면 호스트 포트를 바꿔 실행 |
+
+상세 로그: [8-6. 포트 충돌 진단 · 해제](#8-6-포트-충돌-진단--해제-재현-실습)
 
 **기타:** `set -x`로 로그를 기록할 때 Ubuntu 프롬프트 훅(`__systemd_osc_context_ps0`)의 내부 추적 줄과 machine-id가 함께 출력됨 → `PS0=''`로 훅을 비활성화한 뒤 기록하고, 이미 기록된 줄은 문서에서 제거.
 
@@ -631,7 +747,7 @@ docker volume rm codyssey-data
 
 ### 주의사항
 - **WSL 사용 시 작업 폴더를 Linux 홈(`~`)에 둘 것.** `/mnt/c/...`(Windows 드라이브)에서는 `chmod`가 반영되지 않음
-- 8080~8082 포트를 다른 프로그램이 사용 중이면 `port is already allocated` 오류 → 호스트 포트 번호를 바꿔 실행
+- 8080~8082 포트를 다른 프로그램이 사용 중이면 `port is already allocated` 오류 → [8-6](#8-6-포트-충돌-진단--해제-재현-실습)의 확인·해제 절차를 따르거나 호스트 포트 번호를 바꿔 실행
 - 같은 이름의 컨테이너가 남아 있으면 이름 충돌 → `docker rm -f <이름>` 후 재실행
 - 본 문서의 `/home/seunga` 경로는 작성자 환경 기준 → 재현 시 `$(pwd)` 또는 본인 홈 경로 사용
 
